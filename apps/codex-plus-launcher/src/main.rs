@@ -287,6 +287,25 @@ async fn inject_with_context(
     ctx: BridgeContext,
     runtime: Arc<LauncherRuntimeService>,
 ) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match try_inject_with_context(debug_port, helper_port, ctx.clone(), runtime.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Codex injection failed")))
+}
+
+async fn try_inject_with_context(
+    debug_port: u16,
+    helper_port: u16,
+    ctx: BridgeContext,
+    runtime: Arc<LauncherRuntimeService>,
+) -> anyhow::Result<()> {
     let targets = codex_plus_core::cdp::list_targets(debug_port).await?;
     let target = codex_plus_core::cdp::pick_page_target(&targets)?;
     let websocket_url = target

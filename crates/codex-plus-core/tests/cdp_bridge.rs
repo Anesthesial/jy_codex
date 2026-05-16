@@ -300,6 +300,89 @@ async fn install_bridge_immediately_evaluates_new_document_scripts() {
 }
 
 #[tokio::test]
+async fn install_bridge_returns_after_installing_and_keeps_message_pump_alive() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        let add_script = recv_json(&mut socket).await;
+        assert_eq!(
+            add_script["method"],
+            "Page.addScriptToEvaluateOnNewDocument"
+        );
+        send_json(&mut socket, json!({ "id": add_script["id"], "result": {} })).await;
+
+        let eval_script = recv_json(&mut socket).await;
+        assert_eq!(eval_script["method"], "Runtime.evaluate");
+        send_json(
+            &mut socket,
+            json!({ "id": eval_script["id"], "result": {} }),
+        )
+        .await;
+
+        send_json(
+            &mut socket,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "after-return",
+                        "path": "status",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+
+        let resolve = recv_json(&mut socket).await;
+        assert!(
+            resolve["params"]["expression"]
+                .as_str()
+                .expect("expression should be string")
+                .contains("after-return")
+        );
+        send_json(&mut socket, json!({ "id": resolve["id"], "result": {} })).await;
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handled = Arc::new(AtomicBool::new(false));
+    let handler = {
+        let handled = Arc::clone(&handled);
+        Arc::new(move |_path: String, _payload: serde_json::Value| {
+            let handled = Arc::clone(&handled);
+            Box::pin(async move {
+                handled.store(true, Ordering::SeqCst);
+                Ok(json!({ "status": "ok" }))
+            })
+                as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+        })
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(
+            &url,
+            BRIDGE_BINDING_NAME,
+            handler,
+            &["window.ready = true;".to_string()],
+        ),
+    )
+    .await
+    .expect("bridge install should return after setup")
+    .expect("bridge install should succeed");
+
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    assert!(handled.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn install_bridge_command_error_mentions_method_and_id() {
     let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
         let command = recv_json(&mut socket).await;

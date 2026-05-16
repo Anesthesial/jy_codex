@@ -135,12 +135,18 @@ pub async fn install_bridge(
             .await?;
     }
 
-    loop {
-        session.drain_binding_queue().await?;
-        if session.next_message().await?.is_none() {
-            break;
+    session.drain_binding_queue().await?;
+    tokio::spawn(async move {
+        loop {
+            if session.drain_binding_queue().await.is_err() {
+                break;
+            }
+            match session.next_message().await {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
         }
-    }
+    });
 
     Ok(())
 }
@@ -198,7 +204,8 @@ impl<S> CdpSession<S>
 where
     S: SinkExt<Message>
         + StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
-        + Unpin,
+        + Unpin
+        + Send,
     <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
     fn new(socket: S) -> Self {
@@ -293,7 +300,7 @@ where
     fn route_binding_call(
         &mut self,
         message: Value,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + '_>> {
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
             let Some(handler) = self.handler.clone() else {
                 return Ok(());
