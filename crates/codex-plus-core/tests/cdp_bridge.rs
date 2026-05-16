@@ -360,6 +360,75 @@ async fn install_bridge_rejects_bad_payload_with_id_and_continues_after_unparsea
         .expect("server task should finish without panicking");
 }
 
+#[tokio::test]
+async fn install_bridge_queues_consecutive_bindings_without_recursive_dispatch() {
+    let (url, request_rx) = spawn_cdp_server(|mut socket| async move {
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        for request_id in ["first", "second", "third"] {
+            send_json(
+                &mut socket,
+                json!({
+                    "method": "Runtime.bindingCalled",
+                    "params": {
+                        "payload": serde_json::to_string(&json!({
+                            "id": request_id,
+                            "path": "delete",
+                            "payload": { "request": request_id },
+                        })).unwrap(),
+                    },
+                }),
+            )
+            .await;
+        }
+
+        let first = recv_json(&mut socket).await;
+        assert_eq!(first["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&first, "first");
+        assert_no_message_within(&mut socket, Duration::from_millis(150)).await;
+
+        send_json(&mut socket, json!({ "id": first["id"], "result": {} })).await;
+
+        let second = recv_json(&mut socket).await;
+        assert_eq!(second["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&second, "second");
+        assert_ne!(second["id"], first["id"]);
+        assert_no_message_within(&mut socket, Duration::from_millis(150)).await;
+
+        send_json(&mut socket, json!({ "id": second["id"], "result": {} })).await;
+
+        let third = recv_json(&mut socket).await;
+        assert_eq!(third["method"], "Runtime.evaluate");
+        assert_expression_contains_request(&third, "third");
+        assert_ne!(third["id"], first["id"]);
+        assert_ne!(third["id"], second["id"]);
+
+        send_json(&mut socket, json!({ "id": third["id"], "result": {} })).await;
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handler = Arc::new(|_path: String, payload: serde_json::Value| {
+        Box::pin(async move { Ok(json!({ "status": "ok", "request": payload["request"] })) })
+            as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+    )
+    .await
+    .expect("bridge should not hang while draining queued binding calls")
+    .expect("bridge should process queued binding calls");
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+}
+
 type TestSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
 async fn spawn_cdp_server<F, Fut>(handler: F) -> (String, oneshot::Receiver<()>)
@@ -406,6 +475,25 @@ async fn send_json(socket: &mut TestSocket, value: serde_json::Value) {
         .send(Message::Text(value.to_string().into()))
         .await
         .expect("message should send");
+}
+
+async fn assert_no_message_within(socket: &mut TestSocket, duration: Duration) {
+    let next_message = tokio::time::timeout(duration, socket.next()).await;
+    assert!(
+        next_message.is_err(),
+        "bridge dispatched another binding before the previous Runtime.evaluate response"
+    );
+}
+
+fn assert_expression_contains_request(command: &serde_json::Value, request_id: &str) {
+    let expression = command["params"]["expression"]
+        .as_str()
+        .expect("expression should be string");
+    assert!(
+        expression.contains("__codexSessionDeleteResolve"),
+        "{expression}"
+    );
+    assert!(expression.contains(request_id), "{expression}");
 }
 
 async fn close_socket(socket: &mut TestSocket) {

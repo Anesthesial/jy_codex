@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -126,7 +127,12 @@ pub async fn install_bridge(
             .await?;
     }
 
-    while session.next_message().await?.is_some() {}
+    loop {
+        session.drain_binding_queue().await?;
+        if session.next_message().await?.is_none() {
+            break;
+        }
+    }
 
     Ok(())
 }
@@ -176,6 +182,7 @@ async fn connect_cdp_websocket(
 struct CdpSession<S> {
     socket: S,
     responses: HashMap<u64, Value>,
+    binding_calls: VecDeque<Value>,
     handler: Option<BridgeHandler>,
 }
 
@@ -190,6 +197,7 @@ where
         Self {
             socket,
             responses: HashMap::new(),
+            binding_calls: VecDeque::new(),
             handler: None,
         }
     }
@@ -261,10 +269,17 @@ where
         let value: Value = serde_json::from_str(&text).context("failed to parse CDP message")?;
 
         if value.get("method").and_then(Value::as_str) == Some("Runtime.bindingCalled") {
-            self.route_binding_call(value.clone()).await?;
+            self.binding_calls.push_back(value.clone());
         }
 
         Ok(Some(value))
+    }
+
+    async fn drain_binding_queue(&mut self) -> anyhow::Result<()> {
+        while let Some(message) = self.binding_calls.pop_front() {
+            self.route_binding_call(message).await?;
+        }
+        Ok(())
     }
 
     fn route_binding_call(
