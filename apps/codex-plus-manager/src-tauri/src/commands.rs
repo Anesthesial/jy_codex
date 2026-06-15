@@ -453,6 +453,8 @@ pub fn list_local_sessions() -> CommandResult<LocalSessionsPayload> {
             .cmp(&left.updated_at_ms)
             .then_with(|| right.id.cmp(&left.id))
     });
+    let mut seen_session_ids = std::collections::HashSet::new();
+    sessions.retain(|session| seen_session_ids.insert(session.id.clone()));
     let payload = LocalSessionsPayload {
         db_path: db_paths
             .first()
@@ -569,32 +571,51 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
         session_id: session_id.to_string(),
         title: request.title,
     };
-    let candidate_paths = request
-        .db_path
-        .as_deref()
-        .map(|path| vec![PathBuf::from(path)])
-        .unwrap_or_else(|| {
-            codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(
-                &codex_plus_core::codex_sqlite::default_codex_home_dir(),
-            )
-        });
-    let mut result = DeleteResult {
-        status: codex_plus_core::models::DeleteStatus::Failed,
-        session_id: session_id.to_string(),
-        message: "Thread not found in local storage".to_string(),
-        undo_token: None,
-        backup_path: None,
-    };
-    for db_path in candidate_paths {
-        let adapter = local_session_adapter(&db_path);
-        result = adapter.delete_local(&session);
-        if matches!(
-            result.status,
-            codex_plus_core::models::DeleteStatus::LocalDeleted
-        ) {
-            break;
+    let mut candidate_paths = Vec::new();
+    if let Some(path) = request.db_path.as_deref() {
+        let path = PathBuf::from(path);
+        if !candidate_paths.iter().any(|candidate| candidate == &path) {
+            candidate_paths.push(path);
         }
     }
+    for path in codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(
+        &codex_plus_core::codex_sqlite::default_codex_home_dir(),
+    ) {
+        if !candidate_paths.iter().any(|candidate| candidate == &path) {
+            candidate_paths.push(path);
+        }
+    }
+    log_manager_event(
+        "manager.delete_local_session.start",
+        json!({
+            "session_id": session_id,
+            "title": session.title,
+            "requested_db_path": request.db_path,
+            "candidate_paths": candidate_paths
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+        }),
+    );
+    let result = codex_plus_data::delete_local_from_paths(
+        candidate_paths.clone(),
+        codex_plus_data::BackupStore::new(
+            codex_plus_core::paths::default_app_state_dir().join("backups"),
+        ),
+        &session,
+    );
+    log_manager_event(
+        "manager.delete_local_session.finish",
+        json!({
+            "session_id": session_id,
+            "final_status": format!("{:?}", result.status),
+            "final_message": result.message,
+            "candidate_paths": candidate_paths
+                .iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+        }),
+    );
     let status = if matches!(
         result.status,
         codex_plus_core::models::DeleteStatus::LocalDeleted
@@ -1301,6 +1322,30 @@ pub fn reset_settings() -> CommandResult<SettingsPayload> {
 }
 
 #[tauri::command]
+pub fn reset_image_overlay_settings() -> CommandResult<SettingsPayload> {
+    let store = SettingsStore::default();
+    let mut settings = store.load().unwrap_or_default();
+    let defaults = BackendSettings::default();
+    settings.codex_app_image_overlay_enabled = defaults.codex_app_image_overlay_enabled;
+    settings.codex_app_image_overlay_path = defaults.codex_app_image_overlay_path;
+    settings.codex_app_image_overlay_opacity = defaults.codex_app_image_overlay_opacity;
+    let settings = normalize_settings_before_save(settings);
+    match store.save(&settings) {
+        Ok(()) => settings_payload("图片覆盖层设置已重置。", "图片覆盖层重置后重新读取失败"),
+        Err(error) => failed(
+            &format!("重置图片覆盖层失败：{error}"),
+            SettingsPayload {
+                settings,
+                settings_path: codex_plus_core::paths::default_settings_path()
+                    .to_string_lossy()
+                    .to_string(),
+                user_scripts: user_script_inventory(),
+            },
+        ),
+    }
+}
+
+#[tauri::command]
 pub fn relay_status() -> CommandResult<RelayPayload> {
     let status = codex_plus_core::relay_config::default_relay_status();
     let message = if status.authenticated {
@@ -1768,10 +1813,11 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
     let relay = settings.active_relay_profile();
     log_relay_apply_request("manager.apply_relay_injection", &settings, &relay);
     if relay_has_complete_files(&relay) {
-        return match codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules(
+        return match codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules_and_computer_use_guard(
             &home,
             &relay,
             &relay_combined_common_config(&settings),
+            settings.computer_use_guard_enabled,
         ) {
             Ok(result) => {
                 let status = codex_plus_core::relay_config::relay_status_from_home(&home);
@@ -1872,10 +1918,11 @@ pub fn apply_pure_api_injection() -> CommandResult<RelayPayload> {
     let relay = settings.active_relay_profile();
     log_relay_apply_request("manager.apply_pure_api_injection", &settings, &relay);
     if relay_has_complete_files(&relay) {
-        return match codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules(
+        return match codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules_and_computer_use_guard(
             &home,
             &relay,
             &relay_combined_common_config(&settings),
+            settings.computer_use_guard_enabled,
         ) {
             Ok(result) => {
                 let status = codex_plus_core::relay_config::relay_status_from_home(&home);
@@ -2630,6 +2677,159 @@ mod tests {
     }
 
     #[test]
+    fn delete_local_session_falls_back_when_requested_db_no_longer_contains_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let codex_home = temp.path().join("codex-home");
+        let sqlite_dir = codex_home.join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        let stale_db = sqlite_dir.join("codex-dev.db");
+        let active_db = sqlite_dir.join("state_5.sqlite");
+        let rollout_path = temp.path().join("rollout.jsonl");
+        std::fs::write(&rollout_path, "{\"type\":\"message\"}\n").unwrap();
+        let stale = rusqlite::Connection::open(&stale_db).unwrap();
+        stale
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT)",
+                [],
+            )
+            .unwrap();
+        drop(stale);
+        let active = rusqlite::Connection::open(&active_db).unwrap();
+        active
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT)",
+                [],
+            )
+            .unwrap();
+        active
+            .execute(
+                "INSERT INTO threads VALUES ('t1', ?1, 'Active Thread')",
+                [rollout_path.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        drop(active);
+
+        unsafe {
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+        let result = delete_local_session(DeleteLocalSessionRequest {
+            session_id: "t1".to_string(),
+            title: "Active Thread".to_string(),
+            db_path: Some(stale_db.to_string_lossy().to_string()),
+        });
+        unsafe {
+            if let Some(value) = previous_codex_home {
+                std::env::set_var("CODEX_HOME", value);
+            } else {
+                std::env::remove_var("CODEX_HOME");
+            }
+        }
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(
+            result.payload.status,
+            codex_plus_core::models::DeleteStatus::LocalDeleted
+        );
+        let active = rusqlite::Connection::open(&active_db).unwrap();
+        assert_eq!(
+            active
+                .query_row("SELECT COUNT(*) FROM threads WHERE id = 't1'", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn list_local_sessions_deduplicates_threads_across_current_and_legacy_dbs() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let codex_home = temp.path().join("codex-home");
+        let sqlite_dir = codex_home.join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        let current_db = sqlite_dir.join("state_5.sqlite");
+        let legacy_db = codex_home.join("state_5.sqlite");
+        create_minimal_thread_db(&current_db, "t1", "Current Copy", 100);
+        create_minimal_thread_db(&legacy_db, "t1", "Legacy Copy", 200);
+
+        unsafe {
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+        let result = list_local_sessions();
+        restore_codex_home(previous_codex_home);
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.payload.sessions.len(), 1);
+        assert_eq!(result.payload.sessions[0].id, "t1");
+        assert_eq!(result.payload.sessions[0].title, "Legacy Copy");
+        assert_eq!(
+            result.payload.sessions[0].db_path,
+            legacy_db.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn delete_local_session_removes_duplicate_threads_from_all_candidate_dbs() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let codex_home = temp.path().join("codex-home");
+        let sqlite_dir = codex_home.join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        let current_db = sqlite_dir.join("state_5.sqlite");
+        let legacy_db = codex_home.join("state_5.sqlite");
+        create_minimal_thread_db(&current_db, "t1", "Current Copy", 100);
+        create_minimal_thread_db(&legacy_db, "t1", "Legacy Copy", 200);
+
+        unsafe {
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+        let result = delete_local_session(DeleteLocalSessionRequest {
+            session_id: "t1".to_string(),
+            title: "Legacy Copy".to_string(),
+            db_path: Some(legacy_db.to_string_lossy().to_string()),
+        });
+        restore_codex_home(previous_codex_home);
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(thread_count(&current_db, "t1"), 0);
+        assert_eq!(thread_count(&legacy_db, "t1"), 0);
+    }
+
+    fn create_minimal_thread_db(path: &Path, id: &str, title: &str, updated_at_ms: i64) {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT, updated_at_ms INTEGER)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1, '', ?2, ?3)",
+            (id, title, updated_at_ms),
+        )
+        .unwrap();
+    }
+
+    fn thread_count(path: &Path, id: &str) -> i64 {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.query_row("SELECT COUNT(*) FROM threads WHERE id = ?1", [id], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    }
+
+    fn restore_codex_home(previous: Option<std::ffi::OsString>) {
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var("CODEX_HOME", value);
+            } else {
+                std::env::remove_var("CODEX_HOME");
+            }
+        }
+    }
+
+    #[test]
     fn apply_relay_profile_to_home_with_switch_rules_preserves_custom_provider_id() {
         let temp = tempfile::tempdir().unwrap();
         let profile = RelayProfile {
@@ -2708,6 +2908,41 @@ mod tests {
                 .relay_common_config_contents
                 .contains("[mcp_servers")
         );
+    }
+
+    #[test]
+    fn reset_image_overlay_settings_preserves_supplier_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous = codex_plus_core::paths::set_settings_path_for_tests(Some(settings_path));
+
+        let settings = BackendSettings {
+            codex_app_image_overlay_enabled: true,
+            codex_app_image_overlay_path: "C:\\Users\\me\\Pictures\\overlay.png".to_string(),
+            codex_app_image_overlay_opacity: 42,
+            active_relay_id: "supplier-a".to_string(),
+            relay_profiles: vec![RelayProfile {
+                id: "supplier-a".to_string(),
+                name: "供应商 A".to_string(),
+                relay_mode: codex_plus_core::settings::RelayMode::PureApi,
+                api_key: "sk-test".to_string(),
+                ..RelayProfile::default()
+            }],
+            ..BackendSettings::default()
+        };
+        SettingsStore::default().save(&settings).unwrap();
+
+        let result = reset_image_overlay_settings();
+        codex_plus_core::paths::set_settings_path_for_tests(previous);
+
+        assert_eq!(result.status, "ok");
+        assert!(!result.payload.settings.codex_app_image_overlay_enabled);
+        assert_eq!(result.payload.settings.codex_app_image_overlay_path, "");
+        assert_eq!(result.payload.settings.codex_app_image_overlay_opacity, 35);
+        assert_eq!(result.payload.settings.active_relay_id, "supplier-a");
+        assert_eq!(result.payload.settings.relay_profiles.len(), 1);
+        assert_eq!(result.payload.settings.relay_profiles[0].id, "supplier-a");
+        assert_eq!(result.payload.settings.relay_profiles[0].api_key, "sk-test");
     }
 
     #[test]

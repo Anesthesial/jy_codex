@@ -13,7 +13,9 @@ use codex_plus_core::launcher::{
 };
 #[cfg(windows)]
 use codex_plus_core::launcher::{WindowsProcessControlStrategy, windows_process_control_strategy};
-use codex_plus_core::ports::select_platform_loopback_port_with;
+use codex_plus_core::ports::{
+    select_packaged_codex_debug_port_with, select_platform_loopback_port_with,
+};
 use codex_plus_core::settings::{BackendSettings, RelayProfile, RelayProtocol};
 use codex_plus_core::status::StatusStore;
 
@@ -29,6 +31,32 @@ fn app_paths_find_latest_windows_package_prefers_highest_version_app_dir() {
     assert_eq!(
         latest,
         temp.path().join("OpenAI.Codex_26.429.8261.0_x64__abc/app")
+    );
+}
+
+#[test]
+fn app_paths_find_latest_windows_package_detects_beta_package() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(
+        temp.path()
+            .join("OpenAI.CodexBeta_26.527.7698.0_x64__2p2nqsd0c76g0/app"),
+    )
+    .unwrap();
+
+    let latest = find_latest_codex_app_dir(temp.path()).unwrap();
+
+    assert_eq!(
+        latest,
+        temp.path()
+            .join("OpenAI.CodexBeta_26.527.7698.0_x64__2p2nqsd0c76g0/app")
+    );
+    assert_eq!(
+        codex_app_version(&latest).as_deref(),
+        Some("26.527.7698.0")
+    );
+    assert_eq!(
+        packaged_app_user_model_id(&latest).as_deref(),
+        Some("OpenAI.CodexBeta_2p2nqsd0c76g0!App")
     );
 }
 
@@ -327,6 +355,13 @@ fn ports_windows_falls_back_to_ephemeral_when_requested_is_busy() {
 }
 
 #[test]
+fn ports_windows_packaged_debug_keeps_requested_even_when_busy() {
+    let selected = select_packaged_codex_debug_port_with(9229, true, |_| false, || 43001);
+
+    assert_eq!(selected, 9229);
+}
+
+#[test]
 fn ports_non_windows_keeps_requested_even_when_busy() {
     let selected = select_platform_loopback_port_with(9229, false, |_| false, || 43001);
 
@@ -574,13 +609,87 @@ async fn launch_lifecycle_skips_helper_and_injection_when_enhancements_disabled(
 }
 
 #[tokio::test]
-async fn launch_lifecycle_does_not_apply_active_relay_profile_before_starting_codex() {
+async fn launch_lifecycle_runs_computer_use_guard_when_enabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
+        computer_use_guard_enabled: true,
+        ..BackendSettings::default()
+    });
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    handle.wait_for_codex_exit().await.unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "select-debug:9229",
+            "select-helper:57321",
+            "load-settings",
+            "computer-use-guard",
+            "start-helper:57321",
+            "launch:9229",
+            "computer-use-guard-watchdog",
+            "inject:9229:57321",
+            "status:running",
+            "wait-codex",
+            "shutdown-helper:57321",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn launch_lifecycle_skips_computer_use_guard_by_default() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
     let status_store = StatusStore::new(temp.path().join("latest-status.json"));
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
     let hooks = FakeHooks::new(events.clone());
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    handle.wait_for_codex_exit().await.unwrap();
+
+    let events = events.lock().unwrap().clone();
+    assert!(!events.contains(&"computer-use-guard".to_string()));
+    assert!(!events.contains(&"computer-use-guard-watchdog".to_string()));
+    assert!(events.contains(&"launch:9229".to_string()));
+}
+
+#[tokio::test]
+async fn launch_lifecycle_does_not_apply_relay_profile_while_launching_codex() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
+        relay_profiles_enabled: true,
+        ..BackendSettings::default()
+    });
 
     let handle = launch_and_inject_with_hooks(
         LaunchOptions {
@@ -627,11 +736,12 @@ async fn launch_lifecycle_skips_active_relay_profile_when_supplier_config_disabl
 
     let events = events.lock().unwrap().clone();
     assert!(!events.contains(&"apply-relay".to_string()));
+    assert!(!events.contains(&"computer-use-guard".to_string()));
     assert!(events.contains(&"launch:9229".to_string()));
 }
 
 #[tokio::test]
-async fn launch_lifecycle_tolerates_duplicate_context_parent_tables_before_applying_relay() {
+async fn launch_lifecycle_tolerates_duplicate_context_parent_tables_without_applying_relay() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -678,6 +788,7 @@ experimental_bearer_token = "sk-test"
 
     let events = events.lock().unwrap().clone();
     assert!(!events.contains(&"apply-relay".to_string()));
+    assert!(!events.contains(&"computer-use-guard".to_string()));
     assert!(events.contains(&"launch:9229".to_string()));
 }
 
@@ -716,7 +827,7 @@ async fn launch_lifecycle_enters_degraded_mode_and_retries_when_injection_fails(
     );
     let status = status_store.load_latest().unwrap().unwrap();
     assert_eq!(status.status, "running_degraded");
-    assert!(status.message.contains("Codex 已启动"));
+    assert!(status.message.contains("Codex launched"));
 
     handle.wait_for_codex_exit().await.unwrap();
     let events = events.lock().unwrap().clone();
@@ -1054,6 +1165,11 @@ impl LaunchHooks for FakeHooks {
         Ok(())
     }
 
+    async fn ensure_computer_use_config(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
+        self.event("computer-use-guard");
+        Ok(())
+    }
+
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
         self.event(format!("start-helper:{helper_port}"));
         Ok(())
@@ -1095,6 +1211,14 @@ impl LaunchHooks for FakeHooks {
         _debug_port: u16,
         _helper_port: u16,
     ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn start_computer_use_guard_watchdog(
+        &self,
+        _settings: &BackendSettings,
+    ) -> anyhow::Result<()> {
+        self.event("computer-use-guard-watchdog");
         Ok(())
     }
 

@@ -101,6 +101,7 @@ type BackendSettings = {
   providerSyncLastSelectedProvider: string;
   relayProfilesEnabled: boolean;
   enhancementsEnabled: boolean;
+  computerUseGuardEnabled: boolean;
   codexAppPluginEntryUnlock: boolean;
   codexAppPluginMarketplaceUnlock: boolean;
   codexAppForcePluginInstall: boolean;
@@ -507,6 +508,7 @@ const defaultSettings: BackendSettings = {
   providerSyncLastSelectedProvider: "",
   relayProfilesEnabled: true,
   enhancementsEnabled: true,
+  computerUseGuardEnabled: false,
   codexAppPluginEntryUnlock: true,
   codexAppPluginMarketplaceUnlock: true,
   codexAppForcePluginInstall: true,
@@ -975,6 +977,15 @@ export function App() {
     }
   };
 
+  const resetImageOverlaySettings = async () => {
+    const result = await run(() => call<SettingsResult>("reset_image_overlay_settings"));
+    if (result) {
+      setSettings(result);
+      setSettingsForm(normalizeSettings(result.settings));
+      showNotice("图片覆盖层", result.message, result.status);
+    }
+  };
+
   const refreshAds = async (silent = false) => {
     const result = await run(() => call<AdsResult>("load_ads"));
     if (result) {
@@ -1363,6 +1374,7 @@ export function App() {
       saveSettingsValue,
       refreshSettings,
       resetSettings,
+      resetImageOverlaySettings,
       chooseCodexAppPath: async (mode: "folder" | "file") => {
         let selected: unknown;
         try {
@@ -1650,6 +1662,7 @@ type Actions = {
   saveSettingsValue: (settings: BackendSettings, silent?: boolean) => Promise<void>;
   refreshSettings: (silent?: boolean) => Promise<BackendSettings | null>;
   resetSettings: () => Promise<void>;
+  resetImageOverlaySettings: () => Promise<void>;
   chooseCodexAppPath: (mode: "folder" | "file") => Promise<void>;
   clearCodexAppPath: () => Promise<void>;
   chooseImageOverlayPath: () => Promise<void>;
@@ -1935,6 +1948,17 @@ function EnhanceScreen({
             <span>
               <strong>启用 Codex++ 页面增强</strong>
               <small>关闭后会停用删除、导出、项目移动、Timeline、插件相关和菜单位置增强。</small>
+            </span>
+          </label>
+          <label className="switch-row">
+            <input
+              checked={form.computerUseGuardEnabled}
+              onChange={(event) => onFormChange({ ...form, computerUseGuardEnabled: event.currentTarget.checked })}
+              type="checkbox"
+            />
+            <span>
+              <strong>启用 Windows Computer Use Guard</strong>
+              <small>默认关闭；开启后启动 Codex 时会自动保留官方 Computer Use 插件所需的 config.toml、bundled 插件和 notify 配置。</small>
             </span>
           </label>
           <ModeSelector launchMode={form.launchMode} actions={actions} />
@@ -2642,8 +2666,8 @@ function SettingsScreen({
           </div>
           <Toolbar>
             <Button onClick={() => void actions.saveSettings()}>保存设置</Button>
-            <Button variant="secondary" onClick={() => void actions.resetSettings()}>
-              重置设置
+            <Button variant="secondary" onClick={() => void actions.resetImageOverlaySettings()}>
+              重置背景
             </Button>
           </Toolbar>
         </CardContent>
@@ -4550,6 +4574,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     ...defaultSettings,
     ...settings,
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
+    computerUseGuardEnabled: settings.computerUseGuardEnabled === true,
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
     relayCommonConfigContents,
     relayContextConfigContents,
